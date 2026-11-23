@@ -67,7 +67,6 @@ class PlasticPlayer(Gtk.Application):
 
         playlist_header = Gtk.Label(label="📋 Плейлист")
         playlist_header.set_halign(Gtk.Align.START)
-        # Убран устаревший get_style_context().add_class()
         playlist_box.append(playlist_header)
 
         self.playlist_list = Gtk.ListBox()
