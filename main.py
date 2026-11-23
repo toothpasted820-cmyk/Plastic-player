@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Plastic Player — музыкальный плеер для Linux с плейлистом"""
+"""Plastic Player — музыкальный плеер для Linux с плейлистом и обложками"""
 
 import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Gst', '1.0')
+gi.require_version('GdkPixbuf', '2.0')
 
-from gi.repository import Gtk, Gst, GLib
+from gi.repository import Gtk, Gst, GLib, GdkPixbuf
 import os
 
 Gst.init(None)
@@ -19,6 +20,7 @@ class PlasticPlayer(Gtk.Application):
         self.volume_element = None
         self.playlist = []
         self.current_index = -1
+        self.cover_image = None
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self)
@@ -101,6 +103,14 @@ class PlasticPlayer(Gtk.Application):
         control_box.set_hexpand(True)
         main_box.append(control_box)
 
+        # Обложка альбома
+        self.cover_image = Gtk.Image()
+        self.cover_image.set_size_request(200, 200)
+        self.cover_image.set_halign(Gtk.Align.CENTER)
+        self.cover_image.set_valign(Gtk.Align.CENTER)
+        self.show_cover_placeholder()
+        control_box.append(self.cover_image)
+
         self.title_label = Gtk.Label(label="Нет выбранного трека")
         self.title_label.set_halign(Gtk.Align.CENTER)
         control_box.append(self.title_label)
@@ -162,6 +172,68 @@ class PlasticPlayer(Gtk.Application):
         self.playlist_info.set_halign(Gtk.Align.CENTER)
         control_box.append(self.playlist_info)
 
+    # ========== РАБОТА С ОБЛОЖКАМИ ==========
+
+    def find_cover_for_track(self, track_path):
+        """Ищет файл обложки в папке трека"""
+        folder = os.path.dirname(track_path)
+        if not folder:
+            return None
+
+        cover_names = [
+            "cover.jpg", "cover.png",
+            "folder.jpg", "folder.png",
+            "front.jpg", "front.png",
+            "Cover.jpg", "Cover.png",
+            "Folder.jpg", "Folder.png",
+            "Front.jpg", "Front.png",
+            "COVER.jpg", "COVER.png",
+        ]
+
+        for name in cover_names:
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                return path
+
+        return None
+
+    def show_cover_placeholder(self):
+        """Показывает серый квадрат-заглушку"""
+        # Позиционные аргументы: colorspace, has_alpha, bits_per_sample, width, height
+        pixbuf = GdkPixbuf.Pixbuf.new(
+            GdkPixbuf.Colorspace.RGB,
+            True,
+            8,
+            200,
+            200
+        )
+        pixbuf.fill(0x808080FF)
+        self.cover_image.set_from_pixbuf(pixbuf)
+
+    def update_cover(self, track_path):
+        """Обновляет обложку для текущего трека"""
+        if not track_path:
+            self.show_cover_placeholder()
+            return
+
+        cover_path = self.find_cover_for_track(track_path)
+
+        if cover_path:
+            try:
+                # Позиционные аргументы: filename, width, height, preserve_aspect_ratio
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    cover_path,
+                    200,
+                    200,
+                    True
+                )
+                self.cover_image.set_from_pixbuf(pixbuf)
+            except Exception as e:
+                print(f"Не удалось загрузить обложку {cover_path}: {e}")
+                self.show_cover_placeholder()
+        else:
+            self.show_cover_placeholder()
+
     # ========== ПЛЕЙЛИСТ ==========
 
     def on_add_files(self, button):
@@ -213,6 +285,7 @@ class PlasticPlayer(Gtk.Application):
                 self.player.set_state(Gst.State.NULL)
                 self.title_label.set_label("Нет выбранного трека")
                 self.current_index = -1
+                self.show_cover_placeholder()
 
             self.playlist.pop(index)
             self.playlist_list.remove(row)
@@ -227,27 +300,24 @@ class PlasticPlayer(Gtk.Application):
             self.play_index(index)
 
     def play_index(self, index):
-        """Запуск трека по индексу с правильным кодированием пути"""
+        """Запуск трека по индексу"""
         if index < 0 or index >= len(self.playlist):
             return
 
         self.current_index = index
         path = self.playlist[index]
 
-        # Проверка существования файла
         if not os.path.exists(path):
             print(f"Файл не найден: {path}")
             return
 
         self.player.set_state(Gst.State.NULL)
-
-        # Правильное кодирование пути в URI (работает с кириллицей)
         uri = GLib.filename_to_uri(path, None)
         self.player.set_property("uri", uri)
-
         self.player.set_state(Gst.State.PLAYING)
         self.title_label.set_label(os.path.basename(path))
 
+        self.update_cover(path)
         self.highlight_current_track()
 
     def highlight_current_track(self):
@@ -347,6 +417,7 @@ class PlasticPlayer(Gtk.Application):
                 self.player.set_state(Gst.State.NULL)
                 self.progress.set_value(0)
                 self.title_label.set_label("Плейлист завершён")
+                self.show_cover_placeholder()
         else:
             self.player.set_state(Gst.State.NULL)
             self.progress.set_value(0)
