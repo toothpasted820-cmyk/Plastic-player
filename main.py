@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plastic Player — музыкальный плеер для Linux с плейлистом, обложками, M3U, Hotkeys и DnD"""
+"""Plastic Player — музыкальный плеер для Linux с сохранением плейлистов"""
 
 import gi
 gi.require_version('Gtk', '4.0')
@@ -8,8 +8,13 @@ gi.require_version('GdkPixbuf', '2.0')
 
 from gi.repository import Gtk, Gst, GLib, GdkPixbuf, Gdk
 import os
+import json
 
 Gst.init(None)
+
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "plastic-player")
+PLAYLISTS_DIR = os.path.join(CONFIG_DIR, "playlists")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 
 
 class PlasticPlayer(Gtk.Application):
@@ -21,6 +26,12 @@ class PlasticPlayer(Gtk.Application):
         self.playlist = []
         self.current_index = -1
         self.cover_image = None
+        self.playlists = {}
+        self.active_playlist = ""
+
+        os.makedirs(PLAYLISTS_DIR, exist_ok=True)
+        self.load_settings()
+        # load_all_playlists() вызывается ПОСЛЕ build_ui() в do_activate()
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self)
@@ -53,15 +64,21 @@ class PlasticPlayer(Gtk.Application):
         self.build_ui()
         self.setup_hotkeys()
         self.setup_drag_drop()
-        self.window.present()
 
+        # Загружаем плейлисты ПОСЛЕ создания UI
+        self.load_all_playlists()
+
+        if self.active_playlist and self.active_playlist in self.playlists:
+            self.switch_playlist(self.active_playlist)
+
+        self.window.present()
         GLib.timeout_add(500, self.update_progress)
 
     def build_ui(self):
         main_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.window.set_child(main_box)
 
-        # === ЛЕВАЯ ПАНЕЛЬ: ПЛЕЙЛИСТ ===
+        # === ЛЕВАЯ ПАНЕЛЬ ===
         playlist_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         playlist_box.set_margin_top(10)
         playlist_box.set_margin_bottom(10)
@@ -69,7 +86,18 @@ class PlasticPlayer(Gtk.Application):
         playlist_box.set_margin_end(5)
         playlist_box.set_size_request(300, -1)
 
-        playlist_header = Gtk.Label(label="📋 Плейлист")
+        # Переключатель плейлистов (DropDown вместо ComboBoxText)
+        self.playlist_names = []  # список имён плейлистов
+        string_list = Gtk.StringList.new([])
+        self.playlist_dropdown = Gtk.DropDown.new(string_list, None)
+        self.playlist_dropdown.connect("notify::selected-item", self.on_playlist_changed)
+        playlist_box.append(self.playlist_dropdown)
+
+        btn_new_pl = Gtk.Button(label="➕ Новый плейлист")
+        btn_new_pl.connect("clicked", self.on_new_playlist)
+        playlist_box.append(btn_new_pl)
+
+        playlist_header = Gtk.Label(label="📋 Треки")
         playlist_header.set_halign(Gtk.Align.START)
         playlist_box.append(playlist_header)
 
@@ -84,26 +112,26 @@ class PlasticPlayer(Gtk.Application):
 
         btn_box1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         btn_box1.set_margin_top(5)
-
         add_btn = Gtk.Button(label="➕ Треки")
         add_btn.connect("clicked", self.on_add_files)
         btn_box1.append(add_btn)
-
         m3u_btn = Gtk.Button(label="📂 M3U")
         m3u_btn.connect("clicked", self.on_open_m3u)
         btn_box1.append(m3u_btn)
-
         playlist_box.append(btn_box1)
 
         btn_box2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         remove_btn = Gtk.Button(label="🗑 Удалить")
         remove_btn.connect("clicked", self.on_remove_track)
         btn_box2.append(remove_btn)
+        save_btn = Gtk.Button(label="💾 Сохранить")
+        save_btn.connect("clicked", self.on_save_current_playlist)
+        btn_box2.append(save_btn)
         playlist_box.append(btn_box2)
 
         main_box.append(playlist_box)
 
-        # === ПРАВАЯ ПАНЕЛЬ: УПРАВЛЕНИЕ ===
+        # === ПРАВАЯ ПАНЕЛЬ ===
         control_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         control_box.set_margin_top(20)
         control_box.set_margin_bottom(20)
@@ -112,7 +140,8 @@ class PlasticPlayer(Gtk.Application):
         control_box.set_hexpand(True)
         main_box.append(control_box)
 
-        self.cover_image = Gtk.Image()
+        # Обложка через Gtk.Picture + Gdk.Texture
+        self.cover_image = Gtk.Picture()
         self.cover_image.set_size_request(200, 200)
         self.cover_image.set_halign(Gtk.Align.CENTER)
         self.cover_image.set_valign(Gtk.Align.CENTER)
@@ -123,9 +152,7 @@ class PlasticPlayer(Gtk.Application):
         self.title_label.set_halign(Gtk.Align.CENTER)
         control_box.append(self.title_label)
 
-        self.progress = Gtk.Scale.new_with_range(
-            Gtk.Orientation.HORIZONTAL, 0, 100, 1
-        )
+        self.progress = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self.progress.set_value(0)
         self.progress.connect("value-changed", self.on_progress_changed)
         control_box.append(self.progress)
@@ -137,52 +164,185 @@ class PlasticPlayer(Gtk.Application):
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         controls.set_halign(Gtk.Align.CENTER)
         controls.set_margin_top(10)
-
         self.prev_btn = Gtk.Button(label="⏮ Назад")
         self.prev_btn.connect("clicked", self.on_prev)
         controls.append(self.prev_btn)
-
         self.play_btn = Gtk.Button(label="▶ Играть")
         self.play_btn.connect("clicked", self.on_play)
         controls.append(self.play_btn)
-
         self.pause_btn = Gtk.Button(label="⏸ Пауза")
         self.pause_btn.connect("clicked", self.on_pause)
         controls.append(self.pause_btn)
-
         self.stop_btn = Gtk.Button(label="⏹ Стоп")
         self.stop_btn.connect("clicked", self.on_stop)
         controls.append(self.stop_btn)
-
         self.next_btn = Gtk.Button(label="⏭ Вперёд")
         self.next_btn.connect("clicked", self.on_next)
         controls.append(self.next_btn)
-
         control_box.append(controls)
 
         vol_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         vol_box.set_halign(Gtk.Align.CENTER)
         vol_box.set_margin_top(10)
         vol_box.append(Gtk.Label(label="Громкость:"))
-
-        self.volume_scale = Gtk.Scale.new_with_range(
-            Gtk.Orientation.HORIZONTAL, 0.0, 2.0, 0.05
-        )
+        self.volume_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 2.0, 0.05)
         self.volume_scale.set_value(1.0)
         self.volume_scale.set_hexpand(False)
         self.volume_scale.set_size_request(150, -1)
-        
-        # <-- ИСПРАВЛЕНИЕ: Отключаем реакцию ползунка на клавиатуру
         self.volume_scale.set_can_focus(False)
-        
         self.volume_scale.connect("value-changed", self.on_volume_changed)
         vol_box.append(self.volume_scale)
-
         control_box.append(vol_box)
 
         self.playlist_info = Gtk.Label(label="Треков: 0")
         self.playlist_info.set_halign(Gtk.Align.CENTER)
         control_box.append(self.playlist_info)
+
+    # ========== УПРАВЛЕНИЕ ПЛЕЙЛИСТАМИ ==========
+
+    def load_settings(self):
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, 'r') as f:
+                    settings = json.load(f)
+                    self.active_playlist = settings.get("active_playlist", "")
+        except Exception as e:
+            print(f"Ошибка загрузки настроек: {e}")
+
+    def save_settings(self):
+        try:
+            settings = {"active_playlist": self.active_playlist}
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f)
+        except Exception as e:
+            print(f"Ошибка сохранения настроек: {e}")
+
+    def load_all_playlists(self):
+        """Загружает все плейлисты из папки playlists/"""
+        self.playlists = {}
+        self.playlist_names = []
+
+        if not os.path.exists(PLAYLISTS_DIR):
+            return
+
+        for filename in sorted(os.listdir(PLAYLISTS_DIR)):
+            if filename.endswith(".json"):
+                name = filename[:-5]
+                filepath = os.path.join(PLAYLISTS_DIR, filename)
+                try:
+                    with open(filepath, 'r') as f:
+                        tracks = json.load(f)
+                        self.playlists[name] = tracks
+                        self.playlist_names.append(name)
+                except Exception as e:
+                    print(f"Ошибка загрузки плейлиста {name}: {e}")
+
+        # Обновляем DropDown
+        model = Gtk.StringList.new(self.playlist_names)
+        self.playlist_dropdown.set_model(model)
+
+    def on_playlist_changed(self, dropdown, pspec):
+        """Переключение между сохранёнными плейлистами"""
+        selected = dropdown.get_selected()
+        if selected >= 0 and selected < len(self.playlist_names):
+            name = self.playlist_names[selected]
+            self.switch_playlist(name)
+
+    def switch_playlist(self, name):
+        """Загружает выбранный плейлист в интерфейс"""
+        if name not in self.playlists:
+            return
+
+        # Останавливаем текущее воспроизведение
+        self.player.set_state(Gst.State.NULL)
+        self.current_index = -1
+        self.title_label.set_label("Нет выбранного трека")
+        self.show_cover_placeholder()
+
+        # Очищаем список
+        self.playlist.clear()
+        while self.playlist_list.get_first_child():
+            child = self.playlist_list.get_first_child()
+            self.playlist_list.remove(child)
+
+        # Заполняем новыми треками
+        for path in self.playlists[name]:
+            if os.path.isfile(path):
+                self.playlist.append(path)
+                label = Gtk.Label(
+                    label=os.path.basename(path),
+                    halign=Gtk.Align.START,
+                    margin_top=5, margin_bottom=5, margin_start=5
+                )
+                row = Gtk.ListBoxRow()
+                row.set_child(label)
+                row.file_path = path
+                self.playlist_list.append(row)
+
+        self.active_playlist = name
+        self.update_playlist_info()
+        self.save_settings()
+
+    def on_new_playlist(self, button):
+        """Создание нового пустого плейлиста"""
+        win = Gtk.Window(transient_for=self.window, modal=True)
+        win.set_title("Новый плейлист")
+        win.set_default_size(300, 100)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(10)
+        box.set_margin_bottom(10)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Название плейлиста...")
+        box.append(entry)
+
+        btns = Gtk.Box(spacing=5)
+        btn_ok = Gtk.Button(label="Создать")
+        btn_cancel = Gtk.Button(label="Отмена")
+        btns.append(btn_ok)
+        btns.append(btn_cancel)
+        box.append(btns)
+
+        win.set_child(box)
+
+        def create_pl(*_):
+            name = entry.get_text().strip()
+            if name and name not in self.playlists:
+                self.playlists[name] = []
+                self.playlist_names.append(name)
+                # Обновляем модель DropDown
+                model = Gtk.StringList.new(self.playlist_names)
+                self.playlist_dropdown.set_model(model)
+                # Выбираем новый плейлист
+                self.playlist_dropdown.set_selected(len(self.playlist_names) - 1)
+                self.switch_playlist(name)
+            win.destroy()
+
+        def cancel(*_):
+            win.destroy()
+
+        btn_ok.connect("clicked", create_pl)
+        btn_cancel.connect("clicked", cancel)
+        entry.connect("activate", create_pl)
+
+        win.present()
+
+    def on_save_current_playlist(self, button):
+        """Сохраняет текущий плейлист в файл"""
+        if not self.active_playlist:
+            print("Сначала создайте или выберите плейлист")
+            return
+
+        filepath = os.path.join(PLAYLISTS_DIR, f"{self.active_playlist}.json")
+        try:
+            with open(filepath, 'w') as f:
+                json.dump(self.playlist, f, ensure_ascii=False, indent=2)
+            print(f"Плейлист '{self.active_playlist}' сохранён ({len(self.playlist)} треков)")
+        except Exception as e:
+            print(f"Ошибка сохранения: {e}")
 
     # ========== ГОРЯЧИЕ КЛАВИШИ ==========
 
@@ -190,11 +350,11 @@ class PlasticPlayer(Gtk.Application):
         controller = Gtk.ShortcutController()
         controller.set_scope(Gtk.ShortcutScope.LOCAL)
         self.window.add_controller(controller)
-
         shortcuts = [
             ("space", lambda *_: self.toggle_play()),
             ("<Control>o", lambda *_: self.on_add_files(None)),
             ("<Control>m", lambda *_: self.on_open_m3u(None)),
+            ("<Control>s", lambda *_: self.on_save_current_playlist(None)),
             ("Right", lambda *_: self.seek_forward()),
             ("Left", lambda *_: self.seek_backward()),
             ("Up", lambda *_: self.change_volume(0.05)),
@@ -203,7 +363,6 @@ class PlasticPlayer(Gtk.Application):
             ("n", lambda *_: self.on_next(None)),
             ("p", lambda *_: self.on_prev(None)),
         ]
-
         for key, callback in shortcuts:
             shortcut = Gtk.Shortcut.new(
                 trigger=Gtk.ShortcutTrigger.parse_string(key),
@@ -239,14 +398,10 @@ class PlasticPlayer(Gtk.Application):
             pass
 
     def change_volume(self, delta):
-        """Изменение громкости с визуальным обновлением ползунка"""
         if self.volume_element:
             current = self.volume_element.get_property("volume")
             new_vol = max(0.0, min(2.0, current + delta))
-            
             self.volume_element.set_property("volume", new_vol)
-            
-            # Синхронизируем ползунок без триггера value-changed
             self._volume_changing = True
             self.volume_scale.set_value(new_vol)
             self._volume_changing = False
@@ -271,16 +426,13 @@ class PlasticPlayer(Gtk.Application):
                         label = Gtk.Label(
                             label=os.path.basename(path),
                             halign=Gtk.Align.START,
-                            margin_top=5,
-                            margin_bottom=5,
-                            margin_start=5
+                            margin_top=5, margin_bottom=5, margin_start=5
                         )
                         row = Gtk.ListBoxRow()
                         row.set_child(label)
                         row.file_path = path
                         self.playlist_list.append(row)
                         added += 1
-
             if added > 0:
                 self.update_playlist_info()
                 if self.current_index == -1 and self.playlist:
@@ -295,12 +447,10 @@ class PlasticPlayer(Gtk.Application):
         folder = os.path.dirname(track_path)
         if not folder:
             return None
-        cover_names = [
-            "cover.jpg", "cover.png", "folder.jpg", "folder.png",
-            "front.jpg", "front.png", "Cover.jpg", "Cover.png",
-            "Folder.jpg", "Folder.png", "Front.jpg", "Front.png",
-            "COVER.jpg", "COVER.png",
-        ]
+        cover_names = ["cover.jpg", "cover.png", "folder.jpg", "folder.png",
+                       "front.jpg", "front.png", "Cover.jpg", "Cover.png",
+                       "Folder.jpg", "Folder.png", "Front.jpg", "Front.png",
+                       "COVER.jpg", "COVER.png"]
         for name in cover_names:
             path = os.path.join(folder, name)
             if os.path.isfile(path):
@@ -308,11 +458,10 @@ class PlasticPlayer(Gtk.Application):
         return None
 
     def show_cover_placeholder(self):
-        pixbuf = GdkPixbuf.Pixbuf.new(
-            GdkPixbuf.Colorspace.RGB, True, 8, 200, 200
-        )
+        pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 200, 200)
         pixbuf.fill(0x808080FF)
-        self.cover_image.set_from_pixbuf(pixbuf)
+        texture = Gdk.Texture.new_for_pixbuf(pixbuf)
+        self.cover_image.set_paintable(texture)
 
     def update_cover(self, track_path):
         if not track_path:
@@ -321,10 +470,9 @@ class PlasticPlayer(Gtk.Application):
         cover_path = self.find_cover_for_track(track_path)
         if cover_path:
             try:
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                    cover_path, 200, 200, True
-                )
-                self.cover_image.set_from_pixbuf(pixbuf)
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(cover_path, 200, 200, True)
+                texture = Gdk.Texture.new_for_pixbuf(pixbuf)
+                self.cover_image.set_paintable(texture)
             except Exception as e:
                 print(f"Не удалось загрузить обложку {cover_path}: {e}")
                 self.show_cover_placeholder()
@@ -377,19 +525,12 @@ class PlasticPlayer(Gtk.Application):
                     line = line.strip()
                     if not line or line.startswith('#'):
                         continue
-                    if os.path.isabs(line):
-                        track_path = line
-                    else:
-                        track_path = os.path.join(m3u_dir, line)
+                    track_path = line if os.path.isabs(line) else os.path.join(m3u_dir, line)
                     if os.path.isfile(track_path) and track_path not in self.playlist:
                         self.playlist.append(track_path)
-                        label = Gtk.Label(
-                            label=os.path.basename(track_path),
-                            halign=Gtk.Align.START,
-                            margin_top=5,
-                            margin_bottom=5,
-                            margin_start=5
-                        )
+                        label = Gtk.Label(label=os.path.basename(track_path),
+                                          halign=Gtk.Align.START,
+                                          margin_top=5, margin_bottom=5, margin_start=5)
                         row = Gtk.ListBoxRow()
                         row.set_child(label)
                         row.file_path = track_path
@@ -407,13 +548,9 @@ class PlasticPlayer(Gtk.Application):
                     path = file.get_path()
                     if path and path not in self.playlist:
                         self.playlist.append(path)
-                        label = Gtk.Label(
-                            label=os.path.basename(path),
-                            halign=Gtk.Align.START,
-                            margin_top=5,
-                            margin_bottom=5,
-                            margin_start=5
-                        )
+                        label = Gtk.Label(label=os.path.basename(path),
+                                          halign=Gtk.Align.START,
+                                          margin_top=5, margin_bottom=5, margin_start=5)
                         row = Gtk.ListBoxRow()
                         row.set_child(label)
                         row.file_path = path
@@ -542,9 +679,7 @@ class PlasticPlayer(Gtk.Application):
             if duration > 0:
                 value = scale.get_value()
                 new_pos = int((value / 100) * duration)
-                self.player.seek_simple(
-                    Gst.Format.TIME, Gst.SeekFlags.FLUSH, new_pos
-                )
+                self.player.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, new_pos)
         except Exception:
             pass
 
